@@ -4,6 +4,55 @@
 
 ---
 
+## 目录
+
+- [1. 模型结构的张量组织](#1-模型结构的张量组织)
+- [2. GGUF 张量名称 → 模型结构字段的映射](#2-gguf-张量名称--模型结构字段的映射)
+- [3. 权重张量的字段状态](#3-权重张量的字段状态)
+- [4. 从权重到计算图：用具体数字走一遍](#4-从权重到计算图用具体数字走一遍)
+  - [4.1 假设一个小模型](#41-假设一个小模型)
+  - [4.2 步骤 1：输入 — 从 token 到向量](#42-步骤-1输入--从-token-到向量)
+  - [4.3 步骤 2：注意力前的归一化（RMS Norm）](#43-步骤-2注意力前的归一化rms-norm)
+  - [4.4 步骤 3：Q/K/V 投影（矩阵乘法）](#44-步骤-3qkv-投影矩阵乘法)
+  - [4.5 步骤 4：RoPE 旋转位置编码](#45-步骤-4rope-旋转位置编码)
+  - [4.6 步骤 5：注意力计算](#46-步骤-5注意力计算)
+  - [4.7 步骤 6：输出投影 + 残差连接](#47-步骤-6输出投影--残差连接)
+  - [4.8 步骤 7：FFN（前馈网络）](#48-步骤-7ffn前馈网络)
+  - [4.9 步骤 8：再次残差连接](#49-步骤-8再次残差连接)
+  - [4.10 全流程总结](#410-全流程总结一图看懂)
+- [5. 模型权重的两种角色](#5-模型权重的两种角色)
+- [6. 叶子节点与计算节点的区别](#6-叶子节点与计算节点的区别)
+- [7. 输入张量的特殊处理](#7-输入张量的特殊处理)
+- [8. 输出张量的对应](#8-输出张量的对应)
+- [9. 总结：三层对应关系](#9-总结三层对应关系)
+- [10. 模型加载的完整逻辑](#10-模型加载的完整逻辑)
+  - [10.1 总览：加载的五步流程](#101-总览加载的五步流程)
+  - [10.2 第 1 步：读取 GGUF 文件](#102-第-1-步读取-gguf-文件)
+  - [10.3 第 2 步：检测模型架构](#103-第-2-步检测模型架构)
+  - [10.4 第 3 步：加载超参数](#104-第-3-步加载超参数)
+  - [10.5 第 4 步：加载词表](#105-第-4-步加载词表)
+  - [10.6 第 5 步：加载张量（核心）](#106-第-5-步加载张量核心)
+  - [10.7 完整加载流程图](#107-完整加载流程图从文件到可推理状态)
+  - [10.8 分片模型的加载](#108-分片模型split-model的加载)
+  - [10.9 错误处理](#109-错误处理)
+- [11. 权重数据加载的详细代码逻辑](#11-权重数据加载的详细代码逻辑)
+  - [11.1 三条加载路径总览](#111-三条加载路径总览)
+  - [11.2 前置知识：llama_model_loader 的关键字段](#112-前置知识llama_model_loader-的关键字段)
+  - [11.3 阶段 A：create_tensor — 只记录位置，不读数据](#113-阶段-acreate_tensor--只记录位置不读数据)
+  - [11.4 阶段 B：init_mappings — 建立 mmap 映射](#114-阶段-binit_mappings--建立-mmap-映射)
+  - [11.5 阶段 C：load_all_data — 把数据关联到张量](#115-阶段-cload_all_data--把数据关联到张量)
+  - [11.6 用具体例子走一遍](#116-用具体例子走一遍)
+  - [11.7 加载后的张量状态对比](#117-加载后的张量状态对比)
+  - [11.8 完整时间线](#118-完整时间线)
+- [12. 推理全流程：从用户输入到模型输出](#12-推理全流程从用户输入到模型输出)
+  - [12.1 一句话总结](#121-一句话总结)
+  - [12.2 用具体例子走一遍](#122-用具体例子走一遍)
+  - [12.3 自回归生成循环](#123-自回归生成循环)
+  - [12.4 完整推理时间线](#124-完整推理时间线)
+  - [12.5 数据流转总结](#125-数据流转总结)
+
+---
+
 ## 1. 模型结构的张量组织
 
 `llama_model` 类（`src/llama-model.h`）将模型权重组织为两级结构：全局张量 + 逐层张量。
@@ -1031,3 +1080,680 @@ split_mode = ROW：同一层内按行切分到不同 GPU
   显存不足             → GPU 分配失败 → fallback 到 CPU 或报错
   文件损坏             → mmap 后校验失败 → throw "invalid tensor data"
 ```
+
+---
+
+## 11. 权重数据加载的详细代码逻辑
+
+### 11.1 三条加载路径总览
+
+```
+                        GGUF 文件中的权重数据
+                               │
+                 ┌─────────────┼─────────────┐
+                 │             │             │
+                 ▼             ▼             ▼
+            路径 A          路径 B         路径 C
+           mmap            read           read
+          (CPU)           (CPU)       (CPU → GPU)
+            │               │              │
+            ▼               ▼              ▼
+     tensor->data      tensor->data    GPU 显存
+     直接指向           指向 CPU       tensor->data
+     mmap 区域          缓冲区         指向 GPU 缓冲区
+```
+
+### 11.2 前置知识：llama_model_loader 的关键字段
+
+```cpp
+struct llama_model_loader {
+    bool use_mmap;             // 是否使用 mmap（默认 true）
+
+    llama_files files;         // FILE* 句柄列表（每个分片一个）
+    llama_mmaps mappings;      // mmap 映射对象列表
+
+    // 核心数据结构：记录每个张量在文件中的位置
+    std::map<std::string, llama_tensor_weight> weights_map;
+};
+
+struct llama_tensor_weight {
+    uint16_t idx;              // 张量在第几个分片文件中
+    size_t   offs;             // 张量数据在文件中的字节偏移
+    ggml_tensor * tensor;      // 指向对应的 ggml_tensor
+};
+```
+
+### 11.3 阶段 A：create_tensor — 只记录位置，不读数据
+
+```cpp
+// llama-model-loader.cpp
+ggml_tensor * llama_model_loader::create_tensor(tn, ne, flags) {
+
+    // 1. tn 生成 GGUF 名称，如 "blk.0.attn_q.weight"
+    std::string name = tn.str();
+
+    // 2. 在 GGUF 张量描述表中查找
+    int tensor_idx = gguf_find_tensor(metadata, name.c_str());
+
+    // 3. 创建 ggml_tensor（此时 data = NULL）
+    ggml_tensor * tensor = ggml_new_tensor(ctx, type, n_dims, ne);
+    ggml_set_name(tensor, name.c_str());
+    // tensor->data = NULL
+    // tensor->buffer = NULL
+    // tensor->op = GGML_OP_NONE
+
+    // 4. 记录：这个张量的数据在文件中的哪个位置
+    //    offs = GGUF 数据区起始偏移 + 张量在数据区内的偏移
+    weights_map[name] = {
+        .idx    = file_index,               // 第几个分片文件
+        .offs   = data_offset + tensor_offset,  // 文件中的绝对偏移
+        .tensor = tensor
+    };
+
+    return tensor;
+    // 注意：此时 tensor->data 仍然是 NULL！
+    //       实际的数据加载在后面的 load_all_data() 中完成
+}
+```
+
+**通俗理解**：`create_tensor` 就像在餐厅点菜——你告诉服务员你要什么菜（张量名称），服务员记下菜单（weights_map），但菜还没上桌（data 还是 NULL）。
+
+### 11.4 阶段 B：init_mappings — 建立 mmap 映射
+
+```cpp
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    if (use_mmap) {
+        for (const auto & file : files) {
+            // 为每个分片文件创建 mmap 映射
+            auto mapping = std::make_unique<llama_mmap>(
+                file.get(),
+                prefetch ? -1 : 0,   // -1 表示预取全部，0 表示按需
+                is_numa
+            );
+            mappings.emplace_back(std::move(mapping));
+        }
+    }
+}
+```
+
+`llama_mmap` 内部的平台实现：
+
+```
+Linux:
+  fd = open("model.gguf", O_RDONLY);
+  addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+  // addr 现在指向整个文件内容的虚拟内存地址
+  // 操作系统负责：当你访问 addr[offset] 时，自动从磁盘读入对应的页
+
+Windows:
+  hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+  addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+  // 原理相同：addr 指向文件的虚拟内存映射
+```
+
+**mmap 之后的内存状态**：
+
+```
+虚拟地址空间：
+  addr ──→ [GGUF文件头|KV元数据|张量描述表|token_embd数据|blk.0.attn_q数据|...]
+           ↑                                                   ↑
+           offset=0                              offset=0x1A3F00
+
+此时还没有任何物理内存被占用（除非 prefetch=true）
+操作系统会在你真正访问某个地址时，才从磁盘读入对应的数据页（缺页中断）
+```
+
+### 11.5 阶段 C：load_all_data — 把数据关联到张量
+
+这是最关键的函数，遍历所有张量，根据路径执行不同的加载逻辑。
+
+```cpp
+void llama_model_loader::load_all_data(...) {
+    // 遍历 ggml_context 中的所有张量
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx);
+         cur != NULL;
+         cur = ggml_get_next_tensor(ctx, cur)) {
+
+        // 1. 查找这个张量在 weights_map 中的记录
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr) continue;  // 非权重张量跳过
+
+        size_t n_size = ggml_nbytes(cur);  // 这个张量占多少字节
+
+        if (use_mmap) {
+            // ═══════════════════════════════════════
+            // 路径 A：mmap 加载（CPU 上的权重）
+            // ═══════════════════════════════════════
+
+            // 2a. 计算 mmap 中这个张量的数据地址
+            const auto & mapping = mappings.at(weight->idx);
+            uint8_t * data = (uint8_t *)mapping->addr() + weight->offs;
+            //             ↑ mmap基地址            ↑ 张量在文件中的偏移
+
+            // data 现在指向 mmap 区域中这个张量的数据
+            // 但 cur->data 还是 NULL，需要分配一个"包装"buffer
+
+            // 3a. 分配 buffer 并设置 data 指针
+            ggml_backend_tensor_alloc(buf_mmap, cur, data);
+            // 内部做两件事：
+            //   cur->buffer = buf_mmap;    ← 标记数据在 CPU mmap buffer 中
+            //   cur->data   = data;        ← 指向 mmap 中的实际数据
+
+        } else {
+            // ═══════════════════════════════════════
+            // 路径 B/C：read 加载（需要显式读文件）
+            // ═══════════════════════════════════════
+
+            const auto & file = files.at(weight->idx);
+
+            if (ggml_backend_buffer_is_host(cur->buffer)) {
+                // ─── 路径 B：CPU 缓冲区 ───
+
+                // 直接读到 tensor->data（之前已经分配好了 CPU 缓冲区）
+                file->seek(weight->offs, SEEK_SET);   // 定位到文件中张量数据的位置
+                file->read_raw(cur->data, n_size);     // 读 n_size 字节到内存
+                // 现在 cur->data 包含了权重数据
+
+            } else {
+                // ─── 路径 C：GPU 显存 ───
+
+                // 不能直接读文件到 GPU，需要两步：
+                // 步骤 1：读文件到 CPU 临时缓冲区（staging buffer）
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(staging_buffer, n_size);
+
+                // 步骤 2：从 CPU 缓冲区异步拷贝到 GPU
+                ggml_backend_tensor_set_async(backend_gpu, cur, staging_buffer, 0, n_size);
+                // 内部调用 cudaMemcpyAsync 或类似 API
+                // 将数据从 CPU 内存拷贝到 GPU 显存
+                // cur->data 现在指向 GPU 显存中的地址
+            }
+        }
+    }
+}
+```
+
+### 11.6 用具体例子走一遍
+
+假设加载 LLaMA-7B 模型，处理 `blk.0.attn_q.weight` 这个张量：
+
+```
+张量信息（来自 GGUF 张量描述表）：
+  名称 = "blk.0.attn_q.weight"
+  类型 = Q4_0（4-bit 量化）
+  形状 = [4096, 4096]（4096 x 4096 矩阵）
+  文件偏移 = 0x1A3F00（相对于文件开头）
+  数据大小 = 4096 * 4096 * 0.5 bytes ≈ 8MB（Q4_0 约每权重 0.5 字节）
+```
+
+#### 路径 A：mmap（默认，最快）
+
+```
+步骤 1：create_tensor 阶段
+  weights_map["blk.0.attn_q.weight"] = {
+    idx = 0,                    // 在第 0 个文件中
+    offs = data_start + 0x1A3F00,  // 绝对偏移
+    tensor = <刚创建的 ggml_tensor>
+  }
+  tensor->data = NULL  ← 还没有数据
+
+步骤 2：init_mappings 阶段
+  mappings[0] = mmap(model.gguf)
+  // 整个文件被映射到虚拟地址空间
+  // 假设映射基地址 = 0x7F0000000000
+
+步骤 3：load_all_data 阶段
+  // 计算 mmap 中这个张量的地址
+  data = mappings[0].addr() + weight->offs
+       = 0x7F0000000000 + 0x1A3F00
+       = 0x7F00001A3F00
+
+  // 分配 buffer 并设置指针
+  ggml_backend_tensor_alloc(buf_mmap, tensor, data)
+    → tensor->buffer = buf_mmap
+    → tensor->data = 0x7F00001A3F00
+
+结果：
+  tensor->data 直接指向 mmap 区域中的权重数据
+  没有任何数据拷贝！
+  操作系统在你真正访问这些数据时才从磁盘读入（缺页中断）
+
+内存布局：
+  mmap 区域：[...其他数据...| blk.0.attn_q.weight 的 8MB 数据 | ...其他数据...]
+                            ↑
+                     tensor->data 指向这里
+```
+
+#### 路径 B：read 到 CPU（use_mmap=false，CPU 模式）
+
+```
+步骤 1-2：同上（但跳过 mmap 创建）
+
+步骤 3：load_all_data 阶段
+  // 先分配 CPU 缓冲区（在之前的 alloc 阶段已完成）
+  tensor->buffer = cpu_buffer;
+  tensor->data = malloc(8MB);  // 实际是 buffer 内的偏移
+
+  // 从文件读取数据到缓冲区
+  file->seek(0x1A3F00, SEEK_SET);
+  file->read_raw(tensor->data, 8MB);
+  // 8MB 数据从磁盘 → CPU 内存
+
+结果：
+  tensor->data 指向 CPU 缓冲区中的 8MB 权重数据
+  数据已经完全在物理内存中
+```
+
+#### 路径 C：read + 拷贝到 GPU
+
+```
+步骤 1-2：同上
+
+步骤 3：load_all_data 阶段
+  // 先分配 GPU 缓冲区
+  tensor->buffer = cuda_buffer;
+  tensor->data = cudaMalloc(8MB);  // GPU 显存中的地址
+
+  // 从文件读到 CPU 临时缓冲区
+  file->seek(0x1A3F00, SEEK_SET);
+  file->read_raw(staging_buffer, 8MB);  // 磁盘 → CPU 内存
+
+  // 从 CPU 异步拷贝到 GPU
+  cudaMemcpyAsync(tensor->data, staging_buffer, 8MB, ...);
+  // CPU 内存 → GPU 显存
+
+结果：
+  tensor->data 指向 GPU 显存中的权重数据
+  数据流：磁盘 → CPU 内存 → GPU 显存（两次拷贝）
+```
+
+### 11.7 加载后的张量状态对比
+
+```
+                    mmap 路径           read(CPU) 路径       read(GPU) 路径
+                    ─────────           ────────────         ──────────────
+tensor->buffer     CPU mmap buffer      CPU buffer           CUDA buffer
+tensor->data       指向 mmap 地址       指向 malloc 地址     指向 GPU 显存地址
+数据拷贝次数        0 次                1 次（文件→内存）     2 次（文件→CPU→GPU）
+加载速度            最快（按需加载）     中等                  最慢
+内存占用            虚拟内存（按需）     物理内存（立即）      物理内存 + 显存
+```
+
+### 11.8 完整时间线
+
+```
+时间 ─────────────────────────────────────────────────────────────────────►
+
+gguf_init_from_file()
+  │ 读文件头、KV、张量描述表（几 MB，瞬间完成）
+  │
+  ▼
+load_arch() / load_hparams() / load_vocab()
+  │ 从 KV 元数据中读取（纯内存操作）
+  │
+  ▼
+load_tensors() 开始
+  │
+  ├─ create_tensor() × N 次
+  │    │ 为每个权重创建 ggml_tensor（data=NULL）
+  │    │ 在 weights_map 中记录文件偏移
+  │    │ ← 此时还没有任何磁盘 I/O
+  │
+  ├─ 分配缓冲区（ggml_backend_alloc_ctx_tensors）
+  │    │ 为每个张量分配 buffer（CPU/GPU）
+  │    │ tensor->buffer 被设置
+  │    │ tensor->data 被设置为 buffer 内的地址（但还没有实际数据）
+  │
+  ├─ init_mappings()（如果 use_mmap=true）
+  │    │ mmap 整个文件（瞬间完成，不读数据）
+  │    │ mappings[i] = mmap(files[i])
+  │
+  └─ load_all_data()
+       │ 遍历所有张量，执行实际的数据加载
+       │
+       │ mmap 路径：tensor->data = mmap_addr + offset（瞬间）
+       │ read 路径：file->read(tensor->data, size)（读磁盘）
+       │ GPU  路径：read + cudaMemcpy（读磁盘 + 传到 GPU）
+       │
+       ▼
+  所有张量就绪
+  tensor->data 指向可用的权重数据
+  tensor->buffer 标识数据所在的后端
+  → 模型加载完成，可以开始推理
+```
+
+---
+
+## 12. 推理全流程：从用户输入到模型输出
+
+### 12.1 一句话总结
+
+```
+用户文本 → 分词（tokenize）→ 查嵌入表 → Transformer 层计算 → 输出 logits → 采样选词 → 反分词（detokenize）→ 输出文本
+```
+
+### 12.2 用具体例子走一遍
+
+假设用户输入 "你好"，模型回复 "世界"。
+
+#### 第 1 步：分词（tokenize）
+
+```c
+// API: llama_tokenize(vocab, text, ..., tokens, ..., true, true)
+// 输入："你好"
+// 输出：token_ids = [1024, 3847]
+
+// 背后发生的事：
+//   1. 预处理：按预分词规则拆分文本
+//   2. 查词表：用 BPE/SPM 算法将子串映射为 token ID
+//   3. 添加特殊 token：如 BOS（句子开头）→ [1, 1024, 3847]
+```
+
+#### 第 2 步：构建 batch 并提交 decode
+
+```c
+// 将 token ID 包装成 batch
+llama_batch batch = llama_batch_get_one(tokens, n_tokens);
+// batch.token  = [1, 1024, 3847]  ← 3 个 token ID
+// batch.n_tokens = 3
+// batch.pos    = NULL（自动管理位置）
+// batch.logits = NULL（只有最后一个 token 需要输出 logits）
+
+// 调用 decode 执行推理
+llama_decode(ctx, batch);
+```
+
+#### 第 3 步：decode 内部流程（核心）
+
+```cpp
+// src/llama-context.cpp: llama_context::decode()
+
+int llama_context::decode(const llama_batch & batch_inp) {
+
+    // 3a. 初始化批次分配器
+    balloc->init(batch_inp, vocab, memory, n_embd, n_seq_max, output_all);
+
+    // 3b. 初始化内存上下文（管理 KV 缓存）
+    mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+
+    // 3c. 将批次拆分为微批次（ubatch），逐个处理
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        // 处理一个微批次
+        auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+
+        // 提取 logits
+        auto * t_logits = res->get_logits();
+        // 从后端缓冲区拷贝 logits 到 CPU
+        if (logits.data && t_logits && n_outputs > 0) {
+            ggml_backend_tensor_get(t_logits, logits.data, ...);
+        }
+    } while (...);
+}
+```
+
+#### 第 4 步：process_ubatch 内部（图构建与执行）
+
+```cpp
+// src/llama-context.cpp: llama_context::process_ubatch()
+
+llm_graph_result * process_ubatch(ubatch, gtype, mctx, ret) {
+
+    // 4a. 构建或复用计算图
+    if (can_reuse(gparams)) {
+        n_reused++;  // 复用上次的图
+    } else {
+        gf = model.build_graph(gparams);           // 构建新图
+        ggml_backend_sched_alloc_graph(sched, gf);  // 分配后端缓冲区
+    }
+
+    // 4b. 填入输入数据
+    res->set_inputs(&ubatch);
+    // 内部做的事：
+    //   将 ubatch.token (token IDs) 写入 inp_tokens 张量
+    //   将 ubatch.pos   (位置信息)  写入 inp_pos 张量
+    //   构建/更新注意力掩码写入 inp_attn 张量
+
+    // 4c. 执行计算图
+    graph_compute(gf, ubatch.n_tokens > 1);
+    // 内部：ggml_backend_sched_graph_compute_async(sched, gf)
+    // 按拓扑序执行所有计算节点，结果写入各节点的 data
+
+    return res;
+}
+```
+
+#### 第 5 步：set_inputs 做了什么（token ID → 嵌入向量）
+
+```cpp
+// src/llama-graph.cpp: llm_graph_input_embd::set_input()
+
+void set_input(const llama_ubatch * ubatch) {
+    // 将 token IDs 拷贝到图的输入张量
+    ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens * sizeof(int32_t));
+    // tokens 张量现在包含 [1, 1024, 3847]
+}
+
+// 计算图中，inpL 张量由 token embedding 操作生成：
+// inpL = tok_embd[tokens]  ← 查嵌入表
+// 即：对于每个 token ID，从 tok_embd 矩阵中取出对应行
+// tok_embd 形状 [n_embd, n_vocab] = [4096, 32000]
+// inpL = tok_embd[:, tokens] → 形状 [4096, 3]
+```
+
+#### 第 6 步：Transformer 层计算（回顾第 4 节）
+
+```
+inpL [4096 x 3]
+  │
+  │  以下对 inpL 的每一列（每个 token）执行相同的操作
+  │
+  ├── Layer 0: RMS Norm → Q/K/V 投影 → RoPE → 注意力 → 残差 → FFN → 残差
+  ├── Layer 1: 同上
+  ├── ...
+  └── Layer 31: 同上
+       │
+       ▼
+  output RMS Norm → output 投影
+       │
+       ▼
+  logits [32000 x 3]  ← 3 个位置上，每个位置 32000 个词的得分
+       │
+       └── 只取最后一个位置的 logits（因为只有最后一个 token 需要预测下一个词）
+           logits_last = logits[:, 2]  形状 [32000]
+```
+
+#### 第 7 步：采样（从 logits 选出下一个 token）
+
+```c
+// API: llama_sampler_sample(smpl, ctx, -1)
+// ctx 中的 logits.data 现在包含 32000 个分数
+
+llama_token llama_sampler_sample(smpl, ctx, idx) {
+    // 获取 logits 指针
+    float * logits = llama_get_logits_ith(ctx, idx);
+    // logits = [0.12, -0.34, 2.15, 0.87, ...]  32000 个数
+
+    // 采样链依次执行：
+    // 1. Temperature: logits /= temperature
+    //    temperature=0.8 → 让分布更尖锐（更确定）
+    //
+    // 2. Top-K: 只保留概率最高的 K 个
+    //    top_k=40 → 从 32000 个中只留前 40 个
+    //
+    // 3. Top-P: 从高到低累加概率，截断到 P
+    //    top_p=0.95 → 累积概率超过 95% 后的 token 被丢弃
+    //
+    // 4. 重复惩罚：降低已出现 token 的概率
+    //
+    // 5. 从剩余 token 中随机采样
+    //    假设选中了 token_id = 5023
+
+    return token_id;  // 5023
+}
+```
+
+#### 第 8 步：反分词（token → 文本）
+
+```c
+// API: llama_token_to_piece(vocab, token_id, buf, ...)
+
+// token_id = 5023 → 查词表 → "世界"
+char buf[32];
+llama_token_to_piece(vocab, 5023, buf, sizeof(buf), 0, true);
+// buf = "世界"
+
+// 输出给用户："世界"
+```
+
+### 12.3 自回归生成循环
+
+上面的步骤只生成一个 token。实际生成多个 token 时，是一个**自回归循环**：
+
+```
+用户输入："你好"
+                │
+                ▼
+  ┌── tokenize ──→ [1, 1024, 3847]
+  │
+  │   ┌── decode(batch=[1, 1024, 3847]) ──→ logits[3] ──→ sample ──→ token 5023 ("世") ──┐
+  │   │                                                                                    │
+  │   │   ┌── decode(batch=[5023]) ──→ logits[1] ──→ sample ──→ token 6102 ("界") ──┐     │
+  │   │   │                                                                          │     │
+  │   │   │   ┌── decode(batch=[6102]) ──→ logits[1] ──→ sample ──→ token 2 (EOS) ─┐│     │
+  │   │   │   │                                                                    ││     │
+  │   │   │   │   EOS token → 停止生成                                              ││     │
+  │   │   │   └────────────────────────────────────────────────────────────────────┘│     │
+  │   │   └─────────────────────────────────────────────────────────────────────────┘     │
+  │   └──────────────────────────────────────────────────────────────────────────────────┘
+  │
+  │   输出：token 5023 → "世"
+  │         token 6102 → "界"
+  │         token 2    → <eos>（停止，不输出）
+  │
+  ▼
+  最终输出："世界"
+```
+
+**关键细节**：
+- 第一次 decode 处理所有输入 token（"提示词阶段"），可以批量处理
+- 后续每次 decode 只处理 1 个新生成的 token（"生成阶段"），因为要等上一步的采样结果
+- 每次 decode 的 KV 缓存会累加，之前 token 的 K/V 不需要重新计算
+
+### 12.4 完整推理时间线
+
+```
+时间 ──────────────────────────────────────────────────────────────────────────────►
+
+"你好"
+  │
+  ▼
+llama_tokenize("你好")
+  │ 输出：token_ids = [1, 1024, 3847]
+  │
+  ▼
+llama_decode(batch = {token: [1, 1024, 3847], n_tokens: 3})
+  │
+  ├─ set_inputs()
+  │    ├─ token IDs → inp_tokens 张量
+  │    └─ 位置 [0,1,2] → inp_pos 张量
+  │
+  ├─ graph_compute()
+  │    │
+  │    ├─ inpL = tok_embd[:, [1, 1024, 3847]]      ← 查嵌入表
+  │    │
+  │    ├─ Layer 0:  norm → QKV → rope → attn → add → ffn → add
+  │    ├─ Layer 1:  ...
+  │    ├─ ...
+  │    └─ Layer 31: ...
+  │         │
+  │         └─ logits = output^T × last_layer_out   ← [32000 x 3]
+  │
+  ├─ 提取最后一个位置的 logits
+  │    └─ logits_last = logits[:, 2]                 ← [32000]
+  │
+  └─ 返回
+  │
+  ▼
+llama_sampler_sample(smpl, ctx, -1)
+  │ Temperature → Top-K → Top-P → 采样
+  │ 输出：token_id = 5023
+  │
+  ▼
+llama_token_to_piece(vocab, 5023)
+  │ 输出："世"
+  │
+  ▼
+llama_decode(batch = {token: [5023], n_tokens: 1})
+  │ ← 注意：只送 1 个新 token，之前的 KV 缓存保留
+  │ ← 新 token 的位置 = 3（接在 [0,1,2] 之后）
+  │
+  ├─ graph_compute()
+  │    └─ ... 得到 logits[32000 x 1]
+  │
+  ▼
+llama_sampler_sample(smpl, ctx, -1)
+  │ 输出：token_id = 6102
+  │
+  ▼
+llama_token_to_piece(vocab, 6102)
+  │ 输出："界"
+  │
+  ▼
+llama_decode(batch = {token: [6102], n_tokens: 1})
+  │
+  ├─ graph_compute()
+  │    └─ ... 得到 logits
+  │
+  ▼
+llama_sampler_sample(smpl, ctx, -1)
+  │ 输出：token_id = 2 (EOS)
+  │
+  ▼
+检测到 EOS → 停止生成
+
+最终输出："世界"
+```
+
+### 12.5 数据流转总结
+
+```
+用户文本
+  │
+  │ [分词器：BPE/SPM]
+  ▼
+token IDs（整数数组）
+  │
+  │ [set_inputs：拷贝到 inp_tokens 张量]
+  ▼
+inp_tokens（ggml_tensor, I32）
+  │
+  │ [计算图内部：tok_embd[:, tokens] 查表]
+  ▼
+inpL 嵌入向量（ggml_tensor, F32）      ← [n_embd x n_tokens]
+  │
+  │ [32 层 Transformer：norm → attn → ffn → ...]
+  ▼
+hidden_states（ggml_tensor, F32）      ← [n_embd x n_tokens]
+  │
+  │ [output 投影：output^T × hidden_states]
+  ▼
+logits（ggml_tensor, F32）             ← [n_vocab x n_tokens]
+  │
+  │ [提取最后一个位置的 logits]
+  │ [采样器：temperature → top-k → top-p → 采样]
+  ▼
+next_token_id（单个整数）
+  │
+  │ [反分词器：查词表]
+  ▼
+输出文本
+```
+
+每一步中 ggml_tensor 的角色：
+- `inp_tokens`：INPUT 标志的输入张量，由 `set_inputs()` 填入 token IDs
+- `tok_embd`：叶子节点（权重），查表时作为 src[0] 被引用
+- `inpL`：计算节点（GET_ROWS 操作），src[0]=tok_embd, src[1]=inp_tokens
+- 中间层各节点：计算节点，src[] 链式连接
+- `logits`：OUTPUT 标志的输出张量，执行后由 `ggml_backend_tensor_get()` 拷贝到 CPU
